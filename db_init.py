@@ -1,43 +1,60 @@
 import json
-import sqlite3
 from pathlib import Path
+from typing import List, Dict, Tuple
 
+from sqlalchemy import create_engine, Column, Integer, Float, String, ForeignKey, CheckConstraint, event
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.exc import IntegrityError
+
+# --- 1. НАСТРОЙКА ПУТЕЙ ---
 DB_PATH = Path(__file__).parent / "shop.db"
 JSON_PATH = Path(__file__).parent / "catalog.json"
 
-def create_tables(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-        PRAGMA foreign_keys = ON;
+# --- 2. ОПИСАНИЕ МОДЕЛЕЙ (ТАБЛИЦ) ---
+Base = declarative_base()
 
-        DROP TABLE IF EXISTS products;
-        DROP TABLE IF EXISTS categories;
 
-        CREATE TABLE categories (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL UNIQUE,
-            description TEXT
-        );
+class Category(Base):
+    __tablename__ = 'categories'
 
-        CREATE TABLE products (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_name TEXT NOT NULL,
-            price        REAL NOT NULL CHECK (price >= 0),
-            category_id  INTEGER NOT NULL,
-            FOREIGN KEY (category_id) REFERENCES categories(id)
-                ON DELETE RESTRICT
-                ON UPDATE CASCADE
-        );
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False, unique=True)
+    description = Column(String, nullable=True)
 
-        CREATE INDEX idx_products_category ON products(category_id);
-    """)
+    products = relationship("Product", back_populates="category", cascade="all, delete-orphan")
 
-def load_catalog() -> list[dict]:
+    def __repr__(self):
+        return f"<Category(name='{self.name}')>"
+
+
+class Product(Base):
+    __tablename__ = 'products'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    product_name = Column(String, nullable=False)
+    price = Column(Float, nullable=False)
+    category_id = Column(Integer, ForeignKey('categories.id', ondelete="RESTRICT"), nullable=False)
+
+    category = relationship("Category", back_populates="products")
+
+    __table_args__ = (
+        CheckConstraint('price >= 0', name='check_price_positive'),
+    )
+
+    def __repr__(self):
+        return f"<Product(name='{self.product_name}', price={self.price})>"
+
+
+# --- 3. ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ ---
+
+def load_catalog() -> List[dict]:
     with open(JSON_PATH, encoding="utf-8") as f:
         return json.load(f)
 
-def normalize(catalog: list[dict]) -> tuple[dict, list[dict]]:
-    categories: dict[str, str] = {}
-    products: list[dict] = []
+
+def normalize(catalog: List[dict]) -> Tuple[Dict[str, str], List[dict]]:
+    categories: Dict[str, str] = {}
+    products: List[dict] = []
 
     for item in catalog:
         cat = item["category"]
@@ -51,40 +68,64 @@ def normalize(catalog: list[dict]) -> tuple[dict, list[dict]]:
 
     return categories, products
 
-def insert_data(conn, categories, products):
-    conn.executemany(
-        "INSERT INTO categories (name, description) VALUES (?, ?)",
-        list(categories.items()),
-    )
-
-    name_to_id = dict(conn.execute("SELECT name, id FROM categories"))
-
-    conn.executemany(
-        "INSERT INTO products (product_name, price, category_id) VALUES (?, ?, ?)",
-        [(p["product_name"], p["price"], name_to_id[p["category_name"]])
-         for p in products],
-    )
-    conn.commit()
 
 def main():
-    catalog = load_catalog()
-    categories, products = normalize(catalog)
+    engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        create_tables(conn)
-        insert_data(conn, categories, products)
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
-        print(f"Категорий: {len(categories)}")
-        print(f"Товаров:   {len(products)}")
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    print("Таблицы успешно созданы.")
 
-        try:
-            conn.execute(
-                "INSERT INTO products (product_name, price, category_id) VALUES (?, ?, ?)",
-                ("Bad", 100, 9999),
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        catalog = load_catalog()
+        categories_dict, products_list = normalize(catalog)
+
+        db_categories = {}
+        for name, desc in categories_dict.items():
+            cat = Category(name=name, description=desc)
+            session.add(cat)
+            db_categories[name] = cat
+
+        session.flush()
+
+        for p in products_list:
+            cat_obj = db_categories[p["category_name"]]
+            prod = Product(
+                product_name=p["product_name"],
+                price=p["price"],
+                category=cat_obj
             )
-            print("FK не работает!")
-        except sqlite3.IntegrityError:
-            print("Внешний ключ работает: товар с несуществующей категорией отклонён")
+            session.add(prod)
+
+        session.commit()
+        print(f"Категорий добавлено: {len(db_categories)}")
+        print(f"Товаров добавлено: {len(products_list)}")
+
+        print("\nПроверяем ограничения...")
+        try:
+            bad_product = Product(product_name="Bad Product", price=100, category_id=9999)
+            session.add(bad_product)
+            session.commit()
+            print("⚠️ Ошибка: Внешний ключ НЕ сработал!")
+        except IntegrityError:
+            session.rollback()
+            print("✅ Успех: Внешний ключ работает (SQLAlchemy заблокировала вставку).")
+
+    except Exception as e:
+        session.rollback()
+        print(f"Произошла ошибка: {e}")
+    finally:
+        session.close()
+
 
 if __name__ == "__main__":
     main()
